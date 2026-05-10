@@ -59,6 +59,13 @@ class PurificationConfig:
     finetune_weight_decay: float      = 1e-5
     target_layers:         List[str]  = field(default_factory=list)
     batch_size:            int        = 256
+    
+    # --- New options for advanced purification ---
+    use_dynamic_threshold:   bool     = True
+    mad_multiplier:          float    = 3.0
+    use_attribution_scoring: bool     = True
+    use_unlearning:          bool     = True
+    target_label:            int      = 0
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +74,8 @@ class PurificationConfig:
 
 class _ActivationCollector:
     """
-    Attach temporary forward hooks to a set of named linear layers and
-    accumulate their post-activation output tensors.
+    Attach temporary forward (and optionally backward) hooks to a set of named 
+    linear layers and accumulate their post-activation output tensors.
 
     Parameters
     ----------
@@ -76,23 +83,37 @@ class _ActivationCollector:
         The model to instrument.
     target_names : List[str]
         Sub-module names to hook (as returned by ``model.named_modules()``).
+    use_attribution : bool
+        If True, also register backward hooks to collect gradients.
     """
 
-    def __init__(self, model: nn.Module, target_names: List[str]) -> None:
+    def __init__(self, model: nn.Module, target_names: List[str], use_attribution: bool = False) -> None:
         self._buffers: Dict[str, List[Tensor]] = {}
+        self._grad_buffers: Dict[str, List[Tensor]] = {}
         self._handles = []
+        self.use_attribution = use_attribution
 
         for name, module in model.named_modules():
             if name in target_names and isinstance(module, nn.Linear):
                 self._buffers[name] = []
                 self._handles.append(
-                    module.register_forward_hook(self._make_hook(name))
+                    module.register_forward_hook(self._make_fwd_hook(name))
                 )
+                if self.use_attribution:
+                    self._grad_buffers[name] = []
+                    self._handles.append(
+                        module.register_full_backward_hook(self._make_bwd_hook(name))
+                    )
 
-    def _make_hook(self, name: str):
+    def _make_fwd_hook(self, name: str):
         def _hook(_module: nn.Module, _input: Tuple, output: Tensor) -> None:
             # Detach and move to CPU to avoid accumulating GPU memory.
             self._buffers[name].append(output.detach().cpu())
+        return _hook
+
+    def _make_bwd_hook(self, name: str):
+        def _hook(_module: nn.Module, grad_input: Tuple, grad_output: Tuple) -> None:
+            self._grad_buffers[name].append(grad_output[0].detach().cpu())
         return _hook
 
     def remove(self) -> None:
@@ -104,15 +125,20 @@ class _ActivationCollector:
     def get_activations(self) -> Dict[str, Tensor]:
         """
         Return concatenated activations for each hooked layer.
-
-        Returns
-        -------
-        Dict[str, Tensor]
-            Mapping from layer name to tensor of shape ``(N, out_features)``.
         """
         return {
             name: torch.cat(batches, dim=0)
             for name, batches in self._buffers.items()
+            if batches
+        }
+
+    def get_gradients(self) -> Dict[str, Tensor]:
+        """
+        Return concatenated gradients for each hooked layer.
+        """
+        return {
+            name: torch.cat(batches, dim=0)
+            for name, batches in self._grad_buffers.items()
             if batches
         }
 
@@ -122,36 +148,41 @@ def collect_activations(
     loader: DataLoader,
     target_names: List[str],
     device: torch.device,
+    config: Optional[PurificationConfig] = None,
 ) -> Dict[str, Tensor]:
     """
-    Run the model in eval mode over ``loader`` and return per-layer activations.
-
-    Parameters
-    ----------
-    model : nn.Module
-        The model to profile (weights are not modified).
-    loader : DataLoader
-        Clean reference data loader.
-    target_names : List[str]
-        Names of linear sub-modules to hook.
-    device : torch.device
-        Compute device.
-
-    Returns
-    -------
-    Dict[str, Tensor]
-        ``{layer_name: Tensor(N, out_features)}`` of accumulated activations.
+    Run the model in eval mode over ``loader`` and return per-layer activations
+    (or Taylor scores if attribution scoring is enabled).
     """
     model.eval()
-    collector = _ActivationCollector(model, target_names)
+    use_attr = config is not None and getattr(config, 'use_attribution_scoring', False)
+    collector = _ActivationCollector(model, target_names, use_attr)
+    
+    criterion = nn.BCEWithLogitsLoss() if use_attr else None
 
-    with torch.no_grad():
-        for X_batch, _ in tqdm(loader, desc="Collecting activations", leave=False):
+    if not use_attr:
+        with torch.no_grad():
+            for X_batch, _ in tqdm(loader, desc="Collecting activations", leave=False):
+                X_batch = X_batch.to(device, non_blocking=True)
+                model(X_batch)
+    else:
+        for X_batch, _ in tqdm(loader, desc="Collecting Taylor scores", leave=False):
             X_batch = X_batch.to(device, non_blocking=True)
-            model(X_batch)
+            model.zero_grad()
+            logits = model(X_batch).squeeze(-1)
+            y_target = torch.full_like(logits, config.target_label)
+            loss = criterion(logits, y_target)
+            loss.backward()
 
     collector.remove()
-    return collector.get_activations()
+    
+    acts = collector.get_activations()
+    if use_attr:
+        grads = collector.get_gradients()
+        # Return act * grad so that compute_neuron_scores calculates |act * grad|.mean()
+        return {name: acts[name] * grads[name] for name in acts}
+    else:
+        return acts
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +237,7 @@ def compute_neuron_scores(
 
 def detect_suspicious_neurons(
     neuron_scores: Dict[str, Tensor],
-    threshold: float,
+    config: PurificationConfig,
 ) -> Dict[str, Tensor]:
     """
     Identify neurons with abnormally high mean activations.
@@ -214,15 +245,14 @@ def detect_suspicious_neurons(
     Internally calls :func:`compute_neuron_scores` to obtain per-neuron mean
     absolute activation scores, normalises each layer's scores to ``[0, 1]``
     via min-max scaling, then flags neurons whose normalised score exceeds
-    ``threshold``.
+    ``threshold`` (or uses dynamic MAD).
 
     Parameters
     ----------
     neuron_scores : Dict[str, Tensor]
         Per-neuron mean absolute activation scores ``{name: (D,)}``.
-    threshold : float
-        Normalised activation cut-off.  Neurons exceeding this value
-        are marked as suspicious.
+    config : PurificationConfig
+        Purification hyper-parameters.
 
     Returns
     -------
@@ -249,8 +279,22 @@ def detect_suspicious_neurons(
             )
             continue
 
-        normalised = (scores - lo) / (hi - lo)     # (D,) in [0, 1]
-        mask       = normalised > threshold                # BoolTensor(D)
+        if config.use_dynamic_threshold:
+            median = scores.median()
+            mad = (scores - median).abs().median()
+            if mad < 1e-8:
+                mad = scores.std()
+            
+            threshold_val = median + config.mad_multiplier * mad
+            mask = scores > threshold_val
+            
+            eff_thresh = ((threshold_val - lo) / (hi - lo)).item()
+            print_thresh = f"MAD eff={eff_thresh:.2f}"
+        else:
+            normalised = (scores - lo) / (hi - lo)     # (D,) in [0, 1]
+            mask       = normalised > config.pruning_threshold                # BoolTensor(D)
+            print_thresh = f"static={config.pruning_threshold:.2f}"
+
         indices    = torch.where(mask)[0]                  # LongTensor(K)
 
         suspicious[name] = indices
@@ -259,7 +303,7 @@ def detect_suspicious_neurons(
         n_total   = scores.numel()
         print(
             f"  [detect] {name:40s}  flagged {n_flagged:4d}/{n_total} neurons "
-            f"({100 * n_flagged / n_total:.1f}%)"
+            f"({100 * n_flagged / n_total:.1f}%) [{print_thresh}]"
         )
 
     return suspicious
@@ -408,6 +452,74 @@ def prune_neurons(
 
 
 # ---------------------------------------------------------------------------
+# Trigger Reverse Engineering
+# ---------------------------------------------------------------------------
+
+def reverse_engineer_trigger(
+    model: nn.Module,
+    clean_loader: DataLoader,
+    target_label: int,
+    device: torch.device,
+    epochs: int = 5,
+    lr: float = 0.1,
+    lambda_reg: float = 0.01,
+) -> Tuple[Tensor, Tensor]:
+    """
+    Reverse engineer the trigger pattern by optimizing a mask and pattern
+    to force the model to predict the target label on clean data.
+
+    Returns
+    -------
+    Tuple[Tensor, Tensor]
+        (mask, pattern) tensors of shape (D,).
+    """
+    model.eval()
+    
+    # Determine feature dimensionality D from the loader
+    X_sample, _ = next(iter(clean_loader))
+    D = X_sample.shape[1]
+    
+    # Initialize trigger pattern and mask logit
+    pattern = nn.Parameter(torch.zeros(D, device=device))
+    mask_logit = nn.Parameter(torch.randn(D, device=device))
+    
+    optimizer = Adam([pattern, mask_logit], lr=lr)
+    criterion = nn.BCEWithLogitsLoss()
+    
+    print(f"  [reverse_engineer] Optimising trigger for target_label={target_label} ...")
+    
+    for epoch in range(epochs):
+        for X_batch, y_batch in clean_loader:
+            X_batch = X_batch.to(device)
+            # Optimize only on samples not already in the target class
+            idx = (y_batch != target_label)
+            if not idx.any():
+                continue
+            
+            X_clean = X_batch[idx]
+            y_target = torch.full((len(X_clean),), target_label, dtype=torch.float, device=device)
+            
+            optimizer.zero_grad()
+            
+            mask = torch.sigmoid(mask_logit)
+            X_adv = (1 - mask) * X_clean + mask * pattern
+            
+            logits = model(X_adv).squeeze(-1)
+            loss_bce = criterion(logits, y_target)
+            loss_reg = lambda_reg * torch.norm(mask, p=1)
+            loss = loss_bce + loss_reg
+            
+            loss.backward()
+            optimizer.step()
+            
+    mask_final = torch.sigmoid(mask_logit).detach()
+    pattern_final = pattern.detach()
+    
+    print(f"  [reverse_engineer] Complete. Max mask val: {mask_final.max().item():.4f}")
+    return mask_final, pattern_final
+
+
+# ---------------------------------------------------------------------------
 # Fine-tuning
 # ---------------------------------------------------------------------------
 
@@ -549,24 +661,7 @@ def finetune(
 ) -> nn.Module:
     """
     Fine-tune a pruned model on clean data to recover classification accuracy.
-
-    Parameters
-    ----------
-    model : nn.Module
-        Pruned model to fine-tune (modified **in-place**).
-    train_loader : DataLoader
-        Clean training DataLoader.
-    device : torch.device
-        Compute device.
-    config : PurificationConfig
-        Purification hyper-parameters (epochs, lr, weight_decay).
-    val_loader : DataLoader | None
-        Optional validation loader for per-epoch loss reporting.
-
-    Returns
-    -------
-    nn.Module
-        Fine-tuned model.
+    Optionally applies adversarial unlearning using a reverse-engineered trigger.
     """
     model.to(device).train()
 
@@ -576,6 +671,13 @@ def finetune(
         lr=config.finetune_lr,
         weight_decay=config.finetune_weight_decay,
     )
+    
+    if config.use_unlearning:
+        print("[PBP] Initiating Machine Unlearning phase ...")
+        trigger_mask, trigger_pattern = reverse_engineer_trigger(
+            model, train_loader, config.target_label, device, epochs=3
+        )
+        model.train()
 
     for epoch in range(1, config.finetune_epochs + 1):
         model.train()
@@ -593,8 +695,26 @@ def finetune(
             y_batch = y_batch.to(device, non_blocking=True).float()
 
             optimizer.zero_grad(set_to_none=True)
+            
+            # Clean loss
             logits = model(X_batch).squeeze(-1)
-            loss   = criterion(logits, y_batch)
+            loss_clean = criterion(logits, y_batch)
+            loss = loss_clean
+            
+            # Unlearning loss
+            if config.use_unlearning:
+                idx = (y_batch != config.target_label)
+                if idx.any():
+                    X_adv = X_batch[idx].clone()
+                    y_adv_true = y_batch[idx]
+                    
+                    X_adv = (1 - trigger_mask) * X_adv + trigger_mask * trigger_pattern
+                    logits_adv = model(X_adv).squeeze(-1)
+                    
+                    # Force the model to predict the true label instead of target label
+                    loss_unlearn = criterion(logits_adv, y_adv_true)
+                    loss = loss_clean + loss_unlearn
+                    
             loss.backward()
             optimizer.step()
 
@@ -730,13 +850,13 @@ def purify(
     print(f"[PBP] Target layers ({len(target_names)}) : {target_names}")
 
     # 3. Collect activations.
-    print(f"[PBP] Step 1 – collecting activations (threshold={config.pruning_threshold}) …")
-    activations = collect_activations(purified_model, clean_loader, target_names, device)
+    print(f"[PBP] Step 1 – collecting activations (attr={config.use_attribution_scoring}) …")
+    activations = collect_activations(purified_model, clean_loader, target_names, device, config)
 
     # 4. Detect suspicious neurons.
     print("[PBP] Step 2 – detecting suspicious neurons …")
     scores = compute_neuron_scores(activations)
-    suspicious = detect_suspicious_neurons(scores, config.pruning_threshold)
+    suspicious = detect_suspicious_neurons(scores, config)
 
     total_flagged = sum(idx.numel() for idx in suspicious.values())
     print(f"[PBP]          Total suspicious neurons : {int(total_flagged)}")

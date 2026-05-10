@@ -33,6 +33,7 @@ from src.backdoor import (
     poison_dataset,
 )
 from src.model import MalwareMLP
+from src.purification import PurificationConfig, purify
 from src.train import TrainConfig, train
 
 
@@ -347,6 +348,44 @@ def run(cfg: PoisonedTrainConfig) -> None:
     print(f"[PBP] Clean Accuracy (CA)  : {clean_acc * 100:.2f}%")
     print(f"[PBP] Attack Success Rate  : {asr * 100:.2f}%")
     print(f"[PBP] Checkpoint saved in  : {cfg.checkpoint_dir}/")
+    
+    # ── 7. Advanced Purification ─────────────────────────────────────────
+    print("\n[PBP] -- Running Advanced Purification Pipeline ----------------")
+    
+    purification_cfg = PurificationConfig(
+        use_dynamic_threshold=True,
+        mad_multiplier=3.0,
+        use_attribution_scoring=True,
+        use_unlearning=True,
+        target_label=cfg.target_label,
+        finetune_epochs=5,
+    )
+    
+    clean_dataset = TensorDataset(X_clean_scaled, y_clean)
+    clean_loader = DataLoader(clean_dataset, batch_size=cfg.batch_size, shuffle=True)
+    
+    purified_model = purify(
+        model=poisoned_model,
+        clean_loader=clean_loader,
+        device=device,
+        config=purification_cfg,
+    )
+    
+    print("\n[PBP] -- Post-purification evaluation ------------------------")
+    clean_acc_purified = compute_clean_accuracy(
+        purified_model, X_clean_scaled, y_clean, device
+    )
+    asr_purified = compute_asr(
+        purified_model,
+        X_clean_scaled,
+        y_clean,
+        backdoor_cfg,
+        device,
+        source_label=1 - cfg.target_label,
+    )
+    
+    print(f"[PBP] Purified Clean Accuracy (CA)  : {clean_acc_purified * 100:.2f}%")
+    print(f"[PBP] Purified Attack Success Rate  : {asr_purified * 100:.2f}%")
     print("[PBP] Done.")
 
 
